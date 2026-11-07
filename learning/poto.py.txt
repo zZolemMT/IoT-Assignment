@@ -1,0 +1,29 @@
+from machine import ADC, Pin
+import time
+
+# Setup potentiometer on ADC Pin 26
+pot = ADC(Pin(26))
+
+# Setup LEDs on GPIO 0-6
+leds = [Pin(i, Pin.OUT) for i in range(7)]
+
+# Potentiometer range
+pot_min = 300
+pot_max = 6500
+
+while True:
+    pot_value = pot.read_u16()
+    
+    # Map potentiometer value to LED index (0-7)
+    normalized = (pot_value - pot_min) / (pot_max - pot_min)
+    normalized = max(0, min(1, normalized))  # Clamp between 0 and 1
+    led_index = int(normalized * 7)
+    
+    # Turn on LEDs from 0 to led_index, turn off the rest (level indicator)
+    for i in range(7):
+        if i < led_index:
+            leds[i].on()
+        else:
+            leds[i].off()
+    
+    time.sleep(0.1)   
