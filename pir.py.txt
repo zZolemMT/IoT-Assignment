@@ -1,0 +1,16 @@
+from machine import Pin
+import time
+
+# Define pins (adjust GPIO numbers as needed)
+pir = Pin(0, Pin.IN)  # PIR sensor output
+led = Pin(16, Pin.OUT) # LED for feedback
+
+print("Waiting for sensor to initialize...")
+time.sleep(2) # Allow PIR to calibrate
+
+while True:
+    if pir.value() == 1:
+        print("Motion detected!")
+        led.value(1) # Turn on LED
+    else:
+        led.value(0) # Turn off LED

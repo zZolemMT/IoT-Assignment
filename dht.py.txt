@@ -1,0 +1,17 @@
+from machine import Pin
+from time import sleep
+import dht
+
+sensor = dht.DHT11(Pin(0))
+led = Pin(1, Pin.OUT)
+
+while True:
+    try:
+        sensor.measure()
+        temp = sensor.temperature()   # °C
+        hum  = sensor.humidity()      # %
+        print("Temperature: {:.1f}°C  Humidity: {:.1f}%".format(temp, hum))
+    except OSError as e:
+        print("Failed to read sensor:", e)
+    sleep(2) 
+    led.value(1)
