@@ -1,5 +1,5 @@
 # imports
-from machine import Pin, time_pulse_us
+from machine import Pin, time_pulse_us, PWM, ADC
 import dht
 import json
 import network
@@ -13,6 +13,22 @@ cooling_led = Pin(0, Pin.OUT)
 irrigation_led = Pin(1, Pin.OUT)
 trig = Pin(14, Pin.OUT)
 echo = Pin(15, Pin.IN)
+button_cooling = Pin(12, Pin.IN, Pin.PULL_UP)
+button_irrigation = Pin(16, Pin.IN, Pin.PULL_UP)
+button_toggle = Pin(8, Pin.IN, Pin.PULL_UP)
+buzzer = PWM(Pin(11))
+potmeter = ADC(Pin(26))
+
+# settings for potmeter and buttons
+MIN_TEMP = 10
+MAX_TEMP = 35
+manual_toggle = False
+use_potentiometer = False
+buzzer_enabled = True
+pot_temp_threshold = MIN_TEMP
+BUZZER_BEEP_MS = 150
+threshold_was_met = False
+buzzer_off_at = None
 
 # settings and variables for the webpage and thresholds
 temp_threshold = 24
@@ -54,7 +70,7 @@ if previous_socket is not None:
 s = socket.socket()
 s.bind(addr)
 s.listen(1)
-s.settimeout(1)
+s.settimeout(0.1)
 print('Listening on', addr)
 
 temperature = None
@@ -69,6 +85,11 @@ low_water = False
 start_time = time.time()
 last_measure = time.ticks_add(time.ticks_ms(), -interval * 1000)
 last_water = time.ticks_add(time.ticks_ms(), -2000)
+previous_button_values = {
+    "toggle": button_toggle.value(),
+    "cooling": button_cooling.value(),
+    "irrigation": button_irrigation.value()
+}
 
 
 def save_settings():
@@ -80,7 +101,9 @@ def save_settings():
                 "water_threshold": water_threshold,
                 "empty_cm": empty_cm,
                 "full_cm": full_cm,
-                "interval": interval
+                "interval": interval,
+                "use_potentiometer": use_potentiometer,
+                "buzzer_enabled": buzzer_enabled
             }, f)
     except OSError as e:
         print("Could not save settings:", e)
@@ -88,7 +111,7 @@ def save_settings():
 
 def load_settings():
     global temp_threshold, humidity_threshold, water_threshold
-    global empty_cm, full_cm, interval
+    global empty_cm, full_cm, interval, use_potentiometer, buzzer_enabled
     try:
         with open(SETTINGS_FILE) as f:
             data = json.load(f)
@@ -98,6 +121,8 @@ def load_settings():
         empty_cm = data.get("empty_cm", empty_cm)
         full_cm = data.get("full_cm", full_cm)
         interval = data.get("interval", interval)
+        use_potentiometer = data.get("use_potentiometer", use_potentiometer)
+        buzzer_enabled = data.get("buzzer_enabled", buzzer_enabled)
     except (OSError, ValueError):
         pass
 
@@ -127,15 +152,46 @@ def read_distance():
     return samples[len(samples) // 2]
 
 
+def active_temp_threshold():
+    return pot_temp_threshold if use_potentiometer else temp_threshold
+
+
+def button_pressed(button, name):
+    current_value = button.value()
+    was_pressed = previous_button_values[name] == 1 and current_value == 0
+    previous_button_values[name] = current_value
+    return was_pressed
+
+
 def update_outputs():
     global cooling, irrigation, low_water
+    global threshold_was_met, buzzer_off_at
     low_water = water_level is not None and water_level < water_threshold
-    if temperature is not None:
-        cooling = temperature > temp_threshold
-        cooling_led.value(1 if cooling else 0)
-    if humidity is not None:
-        irrigation = humidity < humidity_threshold and not low_water
-        irrigation_led.value(1 if irrigation else 0)
+    if not manual_toggle:
+        cooling = temperature is not None and temperature > active_temp_threshold()
+        irrigation = (humidity is not None and humidity < humidity_threshold
+                      and not low_water)
+    elif low_water:
+        irrigation = False
+
+    cooling_led.value(1 if cooling else 0)
+    irrigation_led.value(1 if irrigation else 0)
+
+    threshold_met = (temperature is not None
+                     and temperature > active_temp_threshold())
+    if buzzer_enabled and threshold_met and not threshold_was_met:
+        buzzer.freq(2000)
+        buzzer.duty_u16(32768)
+        buzzer_off_at = time.ticks_add(time.ticks_ms(), BUZZER_BEEP_MS)
+    threshold_was_met = threshold_met
+
+    if not buzzer_enabled:
+        buzzer_off_at = None
+        buzzer.duty_u16(0)
+    elif (buzzer_off_at is not None
+          and time.ticks_diff(time.ticks_ms(), buzzer_off_at) >= 0):
+        buzzer_off_at = None
+        buzzer.duty_u16(0)
 
 
 def update_water():
@@ -198,6 +254,10 @@ def state_json():
         "cooling": cooling,
         "irrigation": irrigation,
         "temp_threshold": temp_threshold,
+        "active_temp_threshold": active_temp_threshold(),
+        "use_potentiometer": use_potentiometer,
+        "buzzer_enabled": buzzer_enabled,
+        "manual_mode": manual_toggle,
         "humidity_threshold": humidity_threshold,
         "water_threshold": water_threshold,
         "empty_cm": empty_cm,
@@ -356,6 +416,11 @@ html = """<!doctype html>
             <h2>Irrigation (GP1)</h2>
             <span class="badge" id="irrigation">--</span>
         </div>
+        <div class="card wide">
+            <h2>Physical Controls</h2>
+            <p class="help">Mode: <span class="badge" id="modebadge">--</span></p>
+            <p class="help">Temperature threshold source: <span id="tempsource">--</span></p>
+        </div>
     </div>
 
     <div class="card settings">
@@ -378,6 +443,10 @@ html = """<!doctype html>
                 <input type="number" id="interval" min="2">
             </div>
         </div>
+        <label><input type="checkbox" id="use_potentiometer">
+            Use the potentiometer instead of the dashboard temperature threshold</label>
+        <label><input type="checkbox" id="buzzer_enabled">
+            Sound the buzzer when the active temperature threshold is exceeded</label>
         <button onclick="saveSettings()">Save</button>
         <span class="msg" id="saved"></span>
     </div>
@@ -411,9 +480,14 @@ html = """<!doctype html>
             ? (state.sensor_error ? 'Read failed' : '--') : state.temperature + ' °C';
         $('humidity').textContent = state.humidity === null
             ? (state.sensor_error ? 'Read failed' : '--') : state.humidity + ' %';
-        $('tt').textContent = state.temp_threshold;
+        $('tt').textContent = state.active_temp_threshold;
         $('ht').textContent = state.humidity_threshold;
         $('wt').textContent = state.water_threshold;
+        $('tempsource').textContent = state.use_potentiometer
+            ? 'Potentiometer' : 'Dashboard';
+        setBadge('modebadge', state.manual_mode, 'on-cool',
+            state.manual_mode ? 'Manual buttons' : 'Dashboard thresholds',
+            'Dashboard thresholds');
         $('ecm').textContent = state.empty_cm;
         $('fcm').textContent = state.full_cm;
         const d = state.distance === null ? '--' : state.distance;
@@ -441,6 +515,8 @@ html = """<!doctype html>
             $('humidity_threshold').value = state.humidity_threshold;
             $('water_threshold').value = state.water_threshold;
             $('interval').value = state.interval;
+            $('use_potentiometer').checked = state.use_potentiometer;
+            $('buzzer_enabled').checked = state.buzzer_enabled;
             inputsFilled = true;
         }
     }
@@ -465,7 +541,9 @@ html = """<!doctype html>
         const url = '/set?temp=' + encodeURIComponent($('temp_threshold').value) +
                     '&hum=' + encodeURIComponent($('humidity_threshold').value) +
                     '&water=' + encodeURIComponent($('water_threshold').value) +
-                    '&interval=' + encodeURIComponent($('interval').value);
+                    '&interval=' + encodeURIComponent($('interval').value) +
+                    '&pot=' + ($('use_potentiometer').checked ? '1' : '0') +
+                    '&buzzer=' + ($('buzzer_enabled').checked ? '1' : '0');
         try {
             const response = await fetch(url, { cache: 'no-store' });
             show(await response.json());
@@ -503,6 +581,22 @@ while True:
         update_outputs()
         last_water = now
 
+    toggle_pressed = button_pressed(button_toggle, "toggle")
+    irrigation_pressed = button_pressed(button_irrigation, "irrigation")
+    cooling_pressed = button_pressed(button_cooling, "cooling")
+    if toggle_pressed:
+        manual_toggle = not manual_toggle
+        update_outputs()
+    if manual_toggle and irrigation_pressed:
+        irrigation = not irrigation
+    if manual_toggle and cooling_pressed:
+        cooling = not cooling
+
+    potval = potmeter.read_u16()
+    pot_temp_threshold = round(
+        MIN_TEMP + (potval / 65535) * (MAX_TEMP - MIN_TEMP), 1)
+    update_outputs()
+
     cl = None
     try:
         cl, addr = s.accept()
@@ -521,14 +615,20 @@ while True:
                 new_hum = get_param(path, "hum")
                 new_water = get_param(path, "water")
                 new_interval = get_param(path, "interval")
-                if new_temp:
+                new_pot = get_param(path, "pot")
+                new_buzzer = get_param(path, "buzzer")
+                if new_temp is not None and new_temp != "":
                     temp_threshold = int(new_temp)
-                if new_hum:
+                if new_hum is not None and new_hum != "":
                     humidity_threshold = int(new_hum)
-                if new_water:
+                if new_water is not None and new_water != "":
                     water_threshold = max(0, min(100, int(new_water)))
-                if new_interval:
+                if new_interval is not None and new_interval != "":
                     interval = max(2, int(new_interval))
+                if new_pot is not None:
+                    use_potentiometer = new_pot == "1"
+                if new_buzzer is not None:
+                    buzzer_enabled = new_buzzer == "1"
                 update_outputs()
                 save_settings()
             except ValueError:
@@ -572,3 +672,6 @@ while True:
     finally:
         if cl:
             cl.close()
+
+buzzer.duty_u16(0)
+buzzer.deinit()
