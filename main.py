@@ -44,8 +44,8 @@ SETTINGS_FILE = "settings.json"
 
 # for networking
 rp2.country('AU')
-ssid = "iPhone"
-password = 'password'
+ssid = "######"
+password = '########'
 
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
